@@ -295,7 +295,7 @@ def main(argv: list[str] | None = None) -> None:
 
     def _warmup() -> None:
         try:
-            body = json.dumps({"texts": ["test@abc.com, Street 123, LA"]}).encode("utf-8")
+            body = json.dumps({"texts": ["test@abc.com, Street No.123, LA"]}).encode("utf-8")
             req = urllib.request.Request(
                 f"http://{args.host}:{args.port}/redact",
                 data=body,
@@ -317,7 +317,7 @@ def main(argv: list[str] | None = None) -> None:
             print(f"Warmup failed: {exc}", flush=True)
 
     threading.Thread(target=_warmup, name="opf-warmup", daemon=True).start()
-    print("Warmup request: curl -s -X POST http://127.0.0.1:8799/redact -H \"Content-Type: application/json\" -d '{\"texts\": [\"test@abc.com, Street 123, LA\"]}'", flush=True)
+    print("Warmup request: curl -s -X POST http://127.0.0.1:8799/redact -H \"Content-Type: application/json\" -d '{\"texts\": [\"test@abc.com, Street No.123, LA\"]}'", flush=True)
 
     try:
         server.serve_forever()
