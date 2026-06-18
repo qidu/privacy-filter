@@ -82,6 +82,34 @@ opf train /path/to/train.jsonl --output-dir /path/to/finetuned_checkpoint
 
 Consult `opf train --help` for more flags and information about the finetuning mode.
 
+### Run as a server (HTTP sidecar)
+
+`serve.py` keeps the model resident in memory and exposes a small JSON API so an
+external process (e.g. the model proxy) can redact PII out of text and restore it
+later. It uses only the Python standard library (no extra dependencies).
+
+```bash
+python serve.py --device auto --port 8799
+```
+
+`--device auto` (the default) probes for `mps` (Apple Silicon), then `cuda`,
+falling back to `cpu`. An explicit `--device cpu|cuda|mps` is tried first, then
+`cpu` as a fallback if that backend fails to load.
+
+`--timeout` bounds each `/redact` call (default 30s; `0` disables). If a single
+inference stalls, the request returns `504` instead of hanging the caller.
+Inference is serialized, so this caps how long any one request can block others.
+
+Endpoints:
+
+- `GET /health` → `{"status":"ok","device":"...","output_mode":"...","model_loaded":true}`
+- `POST /redact` with body `{"texts": ["...", "..."]}` →
+  `{"redacted": ["...", "..."], "mapping": {"⟦PII:0⟧": "original", ...}, "span_count": N}`
+
+Each detected span is replaced with a unique sentinel (`⟦PII:0⟧`, `⟦PII:1⟧`, …) and
+the returned `mapping` lets the caller restore the original values — unlike the bare
+placeholders (`<PRIVATE_EMAIL>`), sentinels are unique and therefore reversible.
+
 ### Structure
 
 - `opf/__main__.py`: unified CLI entrypoint for redact, eval, and train modes.
