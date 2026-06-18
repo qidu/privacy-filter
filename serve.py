@@ -35,6 +35,8 @@ import argparse
 import json
 import sys
 import threading
+import time as time_module
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -197,21 +199,26 @@ def _build_handler(redactor: _Redactor, timeout_s: float | None) -> type[BaseHTT
         def do_POST(self) -> None:  # noqa: N802
             if self.path.split("?", 1)[0] != "/redact":
                 self._send_json(404, {"error": "not found"})
+                print(f"POST {self.path}  status=404  error=not found", flush=True)
                 return
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
                 self._send_json(400, {"error": "invalid Content-Length"})
+                print(f"POST /redact  status=400  error=invalid Content-Length", flush=True)
                 return
             raw = self.rfile.read(length) if length > 0 else b""
+            input_len = len(raw)
             try:
                 parsed = json.loads(raw or b"{}")
             except json.JSONDecodeError as exc:
                 self._send_json(400, {"error": f"invalid JSON: {exc}"})
+                print(f"POST /redact  status=400  input={input_len}B  error=invalid JSON", flush=True)
                 return
             texts = parsed.get("texts")
             if not isinstance(texts, list) or not all(isinstance(t, str) for t in texts):
                 self._send_json(400, {"error": "body must be {\"texts\": [string, ...]}"})
+                print(f"POST /redact  status=400  input={input_len}B  error=invalid body", flush=True)
                 return
             future = executor.submit(redactor.redact_batch, texts)
             try:
@@ -222,11 +229,20 @@ def _build_handler(redactor: _Redactor, timeout_s: float | None) -> type[BaseHTT
                     504,
                     {"error": f"redaction timed out after {timeout_s:g}s"},
                 )
+                print(f"POST /redact  status=504  input={input_len}B  error=timeout", flush=True)
                 return
             except Exception as exc:  # noqa: BLE001 - surface as 500 to caller
                 self._send_json(500, {"error": f"redaction failed: {exc}"})
+                print(f"POST /redact  status=500  input={input_len}B  error={exc}", flush=True)
                 return
             self._send_json(200, result)
+            response_body = json.dumps(result, ensure_ascii=False).encode("utf-8")
+            output_len = len(response_body)
+            print(
+                f"POST /redact  status=200  input={input_len}B  output={output_len}B  "
+                f"texts={len(texts)}  spans={result.get('span_count', 0)}",
+                flush=True,
+            )
 
     return Handler
 
@@ -276,6 +292,33 @@ def main(argv: list[str] | None = None) -> None:
         f"(request timeout: {f'{timeout_s:g}s' if timeout_s else 'disabled'})",
         flush=True,
     )
+
+    def _warmup() -> None:
+        try:
+            body = json.dumps({"texts": ["test@abc.com, Street 123, LA"]}).encode("utf-8")
+            req = urllib.request.Request(
+                f"http://{args.host}:{args.port}/redact",
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            t0 = time_module.perf_counter()
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                result = json.loads(resp.read())
+            elapsed = time_module.perf_counter() - t0
+            output = json.dumps(result, ensure_ascii=False)
+            print(
+                f"Warmup OK  input={len(body)}B  output={len(output)}B  "
+                f"spans={result.get('span_count', 0)}  elapsed={elapsed:.3f}s",
+                flush=True,
+            )
+            print(f"Warmup response: {output}", flush=True)
+        except Exception as exc:
+            print(f"Warmup failed: {exc}", flush=True)
+
+    threading.Thread(target=_warmup, name="opf-warmup", daemon=True).start()
+    print("Warmup request: curl -s -X POST http://127.0.0.1:8799/redact -H \"Content-Type: application/json\" -d '{\"texts\": [\"test@abc.com, Street 123, LA\"]}'", flush=True)
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
