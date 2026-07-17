@@ -13,15 +13,27 @@ GET  /health
 POST /redact
     body {"texts": ["...", "..."]}
     -> {
-         "redacted": ["...", "..."],   # same order as input, PII swapped for sentinels
-         "mapping": {"\u27e6PII:0\u27e7": "alice@x.com", ...},  # sentinel -> original
-         "span_count": <int>
+         "redacted": ["...", "..."],   # same order as input, secrets swapped for sentinels
+         "mapping": {"\u27e6HASH:0\u27e7": "<api key>", "\u27e6PII:1\u27e7": "alice@x.com", ...},
+         "span_count":  <int>,         # total spans (hash + PII)
+         "hash_count":  <int>,         # spans from the hash detector
+         "pii_count":   <int>,         # spans from the OPF model
        }
 
 Sentinels are unique across the whole batch (not just per text), so the returned
 mapping is self-consistent for one request. Placeholders from opf alone are NOT
 reversible (two emails both render as <PRIVATE_EMAIL>), which is why we assign a
 unique sentinel per detected span here.
+
+Hash / key detection
+--------------------
+In addition to OPF, the sidecar runs a fast hex-entropy scan (``hash_detect.py``)
+to catch cryptographic-hash-shaped secrets (API keys, tokens, signed URLs) that
+sequence-labelling models tend to miss. Hash spans are emitted with sentinel
+prefix ``HASH:``; OPF spans use ``PII:``. Hash spans win on overlap (HASH_HIGH
+> HASH_LOW > OPF), so the most reliable signal always wins. Disable with
+``--no-hash-detect`` if your input contains many false-positive hex strings
+(e.g. SHA-256s of public artifacts that you want to keep).
 
 Usage
 -----
@@ -38,17 +50,69 @@ import threading
 import time as time_module
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+import hash_detect
+from hash_detect import HASH_HIGH, HASH_LOW, find_hash_spans
+
 # Sentinel brackets are rare unicode so they are extremely unlikely to occur in
-# real input and survive JSON round-trips. Format: ⟦PII:<n>⟧
-_SENTINEL_OPEN = "\u27e6PII:"
+# real input and survive JSON round-trips. Format: ⟦<KIND>:<n>⟧
+_SENTINEL_OPEN = "\u27e6"
 _SENTINEL_CLOSE = "\u27e7"
+_HASH_SENTINEL_PREFIX = "HASH:"
+_PII_SENTINEL_PREFIX = "PII:"
+
+# Span priority: hash HIGH > hash LOW > OPF. Lower rank = wins on overlap.
+_SPAN_PRIORITY_RANK = {HASH_HIGH: 0, HASH_LOW: 1, "MODEL": 2}
 
 
-def _make_sentinel(index: int) -> str:
-    return f"{_SENTINEL_OPEN}{index}{_SENTINEL_CLOSE}"
+def _make_sentinel(kind: str, index: int) -> str:
+    """Build a sentinel of the form ``⟦<kind>:<n>⟧``.
+
+    ``kind`` is either ``"hash"`` (-> prefix ``HASH:``) or ``"pii"`` (-> ``PII:``).
+    The prefix lets callers tell apart secrets found by the hash detector from
+    PII found by the OPF model, while keeping the overall response shape stable.
+    """
+    prefix = _HASH_SENTINEL_PREFIX if kind == "hash" else _PII_SENTINEL_PREFIX
+    return f"{_SENTINEL_OPEN}{prefix}{index}{_SENTINEL_CLOSE}"
+
+
+@dataclass(frozen=True)
+class _MergedSpan:
+    """Internal union of hash + OPF spans for the merge pass."""
+
+    start: int
+    end: int
+    priority: str  # HASH_HIGH, HASH_LOW, or "MODEL"
+    kind: str  # "hash" or "pii"
+
+
+def _merge_spans_with_priority(spans: list[_MergedSpan]) -> list[_MergedSpan]:
+    """Drop overlapping spans, keeping the highest-priority (then longest) one.
+
+    We process spans in priority order so a HASH_HIGH span always wins over an
+    OPF span even if it starts later. Within one priority tier, longer spans
+    win so e.g. an OPF "PERSON" span (0, 20) is dropped in favour of a HASH_HIGH
+    span (10, 30) that fully contains it.
+    """
+    if not spans:
+        return []
+    accepted: list[_MergedSpan] = []
+    for priority in (HASH_HIGH, HASH_LOW, "MODEL"):
+        group = [s for s in spans if s.priority == priority]
+        # Sort by end-descending (then start-ascending) so a span that extends
+        # further right is preferred on overlap. e.g. for (0,20) and (10,30)
+        # both HASH_HIGH, we want (10,30) to win because it captures more of
+        # the secret. Equal-end ties are broken by earlier start.
+        group.sort(key=lambda s: (-s.end, s.start))
+        for span in group:
+            if any(span.start < acc.end and span.end > acc.start for acc in accepted):
+                continue
+            accepted.append(span)
+    accepted.sort(key=lambda s: s.start)
+    return accepted
 
 
 def _resolve_device_candidates(requested: str) -> list[str]:
@@ -79,10 +143,18 @@ def _resolve_device_candidates(requested: str) -> list[str]:
 class _Redactor:
     """Thread-safe wrapper around a single resident OPF instance."""
 
-    def __init__(self, *, device: str, checkpoint: str | None, output_mode: str) -> None:
+    def __init__(
+        self,
+        *,
+        device: str,
+        checkpoint: str | None,
+        output_mode: str,
+        detect_hashes: bool = True,
+    ) -> None:
         from opf._api import OPF
 
         self._output_mode = output_mode
+        self._detect_hashes = detect_hashes
         # OPF inference is not guaranteed thread-safe; serialize calls.
         self._lock = threading.Lock()
 
@@ -120,38 +192,73 @@ class _Redactor:
     def output_mode(self) -> str:
         return self._output_mode
 
+    @property
+    def detect_hashes(self) -> bool:
+        return self._detect_hashes
+
     def redact_batch(self, texts: list[str]) -> dict[str, Any]:
         """Redact a batch of texts, returning sentinel-substituted text + mapping.
 
-        Sentinel indices are unique across the entire batch.
+        Sentinel indices are unique across the entire batch. Two kinds of
+        sentinels are emitted:
+
+        * ``⟦HASH:n⟧`` — span found by the entropy/whitelist hash detector.
+        * ``⟦PII:n⟧``  — span found by the OPF model.
+
+        On overlap the higher-priority span wins (HASH_HIGH > HASH_LOW > MODEL).
         """
         from opf._api import RedactionResult
 
         redacted: list[str] = []
         mapping: dict[str, str] = {}
         next_index = 0
-        span_count = 0
+        hash_count = 0
+        pii_count = 0
 
         with self._lock:
             for text in texts:
                 if not isinstance(text, str) or not text:
                     redacted.append(text if isinstance(text, str) else "")
                     continue
+
+                # 1) Hash detection — fast, lock-free, no model involved.
+                hash_match: list[_MergedSpan] = []
+                if self._detect_hashes:
+                    hash_match = [
+                        _MergedSpan(hs.start, hs.end, hs.priority, "hash")
+                        for hs in find_hash_spans(text)
+                    ]
+
+                # 2) OPF detection.
                 result = self._opf.redact(text)
-                if not isinstance(result, RedactionResult):
+                opf_match: list[_MergedSpan] = []
+                if isinstance(result, RedactionResult):
+                    opf_match = [
+                        _MergedSpan(s.start, s.end, "MODEL", "pii")
+                        for s in sorted(result.detected_spans, key=lambda x: x.start)
+                    ]
+                else:
                     # output_text_only must stay False; defensive guard.
-                    redacted.append(text)
-                    continue
-                spans = sorted(result.detected_spans, key=lambda s: s.start)
+                    # If OPF returned something unexpected we still honour any
+                    # hash spans we found above rather than leaking them.
+                    pass
+
+                # 3) Merge with priority: hash HIGH > hash LOW > MODEL.
+                merged = _merge_spans_with_priority(hash_match + opf_match)
+
+                # 4) Apply merged spans.
                 pieces: list[str] = []
                 cursor = 0
-                for span in spans:
+                for span in merged:
                     if span.start < cursor or span.end <= span.start:
                         # overlapping / empty span — skip to keep output coherent
                         continue
-                    sentinel = _make_sentinel(next_index)
+                    sentinel = _make_sentinel(span.kind, next_index)
                     next_index += 1
-                    span_count += 1
+                    if span.kind == "hash":
+                        hash_count += 1
+                    else:
+                        pii_count += 1
                     mapping[sentinel] = text[span.start : span.end]
                     pieces.append(text[cursor : span.start])
                     pieces.append(sentinel)
@@ -159,7 +266,13 @@ class _Redactor:
                 pieces.append(text[cursor:])
                 redacted.append("".join(pieces))
 
-        return {"redacted": redacted, "mapping": mapping, "span_count": span_count}
+        return {
+            "redacted": redacted,
+            "mapping": mapping,
+            "span_count": hash_count + pii_count,
+            "hash_count": hash_count,
+            "pii_count": pii_count,
+        }
 
 
 def _build_handler(redactor: _Redactor, timeout_s: float | None) -> type[BaseHTTPRequestHandler]:
@@ -240,7 +353,8 @@ def _build_handler(redactor: _Redactor, timeout_s: float | None) -> type[BaseHTT
             output_len = len(response_body)
             print(
                 f"POST /redact  status=200  input={input_len}B  output={output_len}B  "
-                f"texts={len(texts)}  spans={result.get('span_count', 0)}",
+                f"texts={len(texts)}  spans={result.get('span_count', 0)}  "
+                f"hashes={result.get('hash_count', 0)}  pii={result.get('pii_count', 0)}",
                 flush=True,
             )
 
@@ -276,13 +390,31 @@ def main(argv: list[str] | None = None) -> None:
         default=30.0,
         help="Per-request redaction timeout in seconds (default 30). 0 disables it.",
     )
+    parser.add_argument(
+        "--no-hash-detect",
+        dest="detect_hashes",
+        action="store_false",
+        help=(
+            "Disable the hex-entropy hash/key detector. By default the sidecar "
+            "runs hash_detect.find_hash_spans on every text in addition to OPF, "
+            "to catch API keys and other hash-shaped secrets that the model "
+            "tends to miss. Use this flag if your input contains too many "
+            "false-positive hex strings (e.g. SHA-256s of public artifacts)."
+        ),
+    )
+    parser.set_defaults(detect_hashes=True)
     args = parser.parse_args(argv)
 
-    print(f"Loading OPF model (device={args.device}, output_mode={args.output_mode})...", flush=True)
+    print(
+        f"Loading OPF model (device={args.device}, output_mode={args.output_mode}, "
+        f"hash_detect={args.detect_hashes})...",
+        flush=True,
+    )
     redactor: _Redactor = _Redactor(
         device=args.device,
         checkpoint=args.checkpoint,
         output_mode=args.output_mode,
+        detect_hashes=args.detect_hashes,
     )
     timeout_s = args.timeout if args.timeout and args.timeout > 0 else None
     handler = _build_handler(redactor, timeout_s)

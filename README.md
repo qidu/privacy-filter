@@ -104,11 +104,97 @@ Endpoints:
 
 - `GET /health` → `{"status":"ok","device":"...","output_mode":"...","model_loaded":true}`
 - `POST /redact` with body `{"texts": ["...", "..."]}` →
-  `{"redacted": ["...", "..."], "mapping": {"⟦PII:0⟧": "original", ...}, "span_count": N}`
+  `{"redacted": ["...", "..."], "mapping": {"⟦HASH:0⟧": "<api key>", "⟦PII:1⟧": "alice@x.com", ...}, "span_count": N, "hash_count": N, "pii_count": N}`
 
-Each detected span is replaced with a unique sentinel (`⟦PII:0⟧`, `⟦PII:1⟧`, …) and
+Each detected span is replaced with a unique sentinel (`⟦HASH:0⟧`, `⟦PII:1⟧`, …) and
 the returned `mapping` lets the caller restore the original values — unlike the bare
 placeholders (`<PRIVATE_EMAIL>`), sentinels are unique and therefore reversible.
+Sentinel indices are unique across the whole batch, not just per text.
+
+#### Hash / API-key detection
+
+In addition to the OPF model, the sidecar runs a fast entropy-based scan
+(`hash_detect.py`) to catch cryptographic-hash-shaped secrets (API keys, tokens,
+signed-URL hashes) that sequence-labelling models tend to miss. Hash spans get
+the sentinel prefix `HASH:`; PII spans get `PII:`. On overlap, hash spans always
+win (priority order `HASH_HIGH > HASH_LOW > MODEL`), so the most reliable signal
+wins. Disable with `--no-hash-detect` if your input contains too many
+false-positive hex strings (e.g. SHA-256s of public artifacts you want to keep).
+
+To extend or trim the built-in whitelist without editing `hash_detect.py`, set
+`OPF_HASH_WHITELIST_FILE=/path/to/whitelist.txt` before launching the sidecar.
+One entry per line: a bare token is added, a `-token` line removes a built-in,
+`#` starts a comment. Entries shorter than 8 chars are ignored.
+
+```
+# ~/.opf/hash_whitelist.txt
+badcafe12           # add: don't flag this placeholder
+-fabaceae           # remove: treat this as a real hash
+```
+
+#### End-to-end example
+
+Start the sidecar:
+
+```bash
+python serve.py --device cpu --port 8799
+```
+
+Redact a batch (the same text contains a hash and an email, so you'll see two
+spans):
+
+```bash
+curl -s -X POST http://127.0.0.1:8799/redact \
+  -H "Content-Type: application/json" \
+  -d '{"texts": ["API key=5d41402abc4b2a76b9719d911017c592 leaked for alice@example.com"]}'
+```
+
+Response:
+
+```json
+{
+  "redacted": ["API key=⟦HASH:0⟧ leaked for ⟦PII:1⟧"],
+  "mapping": {
+    "⟦HASH:0⟧": "5d41402abc4b2a76b9719d911017c592",
+    "⟦PII:1⟧": "alice@example.com"
+  },
+  "span_count": 2,
+  "hash_count": 1,
+  "pii_count": 1
+}
+```
+
+To restore the original text later, iterate the response and replace each
+sentinel with its mapped value. The two prefixes let callers distinguish
+hash-shaped secrets (keys, tokens) from model-detected PII (emails, names) when
+they need to handle each class differently — e.g. logging `HASH:` matches to a
+secret-scanning dashboard while routing `PII:` spans to a redaction audit log.
+
+#### Python client
+
+```python
+import json
+import urllib.request
+
+body = json.dumps({"texts": ["contact alice@example.com or use key 5d41402abc4b2a76b9719d911017c592"]}).encode()
+req = urllib.request.Request(
+    "http://127.0.0.1:8799/redact",
+    data=body,
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+with urllib.request.urlopen(req, timeout=30) as resp:
+    result = json.loads(resp.read())
+
+redacted = result["redacted"][0]
+mapping = result["mapping"]
+
+# Later, restore:
+restored = redacted
+for sentinel, original in mapping.items():
+    restored = restored.replace(sentinel, original)
+print(restored)
+```
 
 ### Structure
 
