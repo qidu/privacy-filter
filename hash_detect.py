@@ -50,6 +50,7 @@ __all__ = [
     "shannon_entropy",
     "detect_hash_priority",
     "find_hash_spans",
+    "build_whitelist",
     "HEX_WORDS_WHITELIST",
     "HASH_HIGH",
     "HASH_LOW",
@@ -132,15 +133,51 @@ def _resolve_whitelist() -> frozenset[str]:
     return frozenset(merged)
 
 
+def build_whitelist(
+    add: list[str] | None = None,
+    remove: list[str] | None = None,
+    whitelist_file: str | None = None,
+) -> frozenset[str]:
+    """Build a whitelist from built-ins plus caller-supplied additions/removals.
+
+    This is the programmatic equivalent of the ``OPF_HASH_WHITELIST_FILE``
+    env-var mechanism used at import time: callers (e.g. ``serve.py``) pass
+    additions and removals gathered from CLI flags instead of a file.
+
+    Args:
+        add: Tokens to add on top of the built-ins (lowercased, length-filtered).
+        remove: Tokens to remove from the built-ins (lowercased, length-filtered).
+        whitelist_file: Optional path to an override file (same format as
+            ``OPF_HASH_WHITELIST_FILE``). Applied after ``add``/``remove``.
+    """
+    merged = set(_BUILTIN_HEX_WORDS_WHITELIST)
+    for token in (add or []):
+        t = token.strip().lower()
+        if len(t) >= _MIN_WHITELIST_LEN:
+            merged.add(t)
+    for token in (remove or []):
+        t = token.strip().lower()
+        merged.discard(t)
+    if whitelist_file:
+        file_add, file_remove = _load_user_whitelist_overrides(whitelist_file)
+        merged -= file_remove
+        merged |= file_add
+    return frozenset(merged)
+
+
 # Public whitelist — computed at import time from the built-ins plus any
 # overrides in $OPF_HASH_WHITELIST_FILE. See module docstring for format.
 HEX_WORDS_WHITELIST: frozenset[str] = _resolve_whitelist()
 
-# A token of >= 9 hex chars is worth classifying. We require non-hex
-# boundaries on both sides so we don't slice into UUIDs / hex paths
-# like ``.../deadbeef/...`` mid-string, and so we don't double-match
-# the same hex run twice.
-_TOKEN_RE = re.compile(r"(?<![a-fA-F0-9])[a-fA-F0-9]{9,}(?![a-fA-F0-9])")
+
+def _build_token_re(min_len: int) -> re.Pattern[str]:
+    """Return a compiled regex that captures hex runs of at least ``min_len`` chars."""
+    return re.compile(rf"(?<![a-fA-F0-9])[a-fA-F0-9]{{{min_len},}}(?![a-fA-F0-9])")
+
+
+# Default token regex (min_len == 8).  Callers that need a different min_len
+# should call find_hash_spans with an explicit min_len.
+_TOKEN_RE = _build_token_re(_MIN_WHITELIST_LEN)
 
 # Reference ordering for sequence detection. Strings whose sorted chars
 # are a permutation of the first N entries of this alphabet (e.g.
@@ -178,21 +215,29 @@ def _is_ordered_hex_sequence(token: str) -> bool:
     return sorted(token.lower()) == list(_HEX_ALPHABET[: len(token)])
 
 
-def detect_hash_priority(token: str, entropy_threshold: float = 3.0) -> str:
+def detect_hash_priority(
+    token: str,
+    entropy_threshold: float = 3.0,
+    whitelist: frozenset[str] | None = None,
+    min_len: int = _MIN_WHITELIST_LEN,
+) -> str:
     """Classify a single token as a likely hash.
 
     Returns one of :data:`HASH_HIGH`, :data:`HASH_LOW`, :data:`HASH_NO`.
 
-    The default ``entropy_threshold`` of 3.0 is permissive enough to catch
-    real-world MD5 / SHA prefixes (which can have entropy around 3.3), while
-    still filtering out repetitive runs (``ffff...``, ``abababab...``).
+    Args:
+        token: The hex string to classify.
+        entropy_threshold: Shannon entropy cutoff (default 3.0).
+        whitelist: Token whitelist to use; defaults to :data:`HEX_WORDS_WHITELIST`.
+        min_len: Minimum token length to consider (default 8).
     """
     if not re.fullmatch(r"[a-fA-F0-9]+", token):
         return HASH_NO
-    if token.lower() in HEX_WORDS_WHITELIST:
+    effective_whitelist = HEX_WORDS_WHITELIST if whitelist is None else whitelist
+    if token.lower() in effective_whitelist:
         return HASH_NO
     length = len(token)
-    if length <= 8:
+    if length < min_len:
         return HASH_NO
     if _is_ordered_hex_sequence(token):
         return HASH_NO
@@ -204,19 +249,34 @@ def detect_hash_priority(token: str, entropy_threshold: float = 3.0) -> str:
 
 
 def find_hash_spans(
-    text: str, entropy_threshold: float = 3.0
+    text: str,
+    entropy_threshold: float = 3.0,
+    whitelist: frozenset[str] | None = None,
+    min_len: int = _MIN_WHITELIST_LEN,
 ) -> list[HashSpan]:
     """Find hash-shaped spans in ``text``.
 
     Spans are returned in left-to-right order. ``HASH_NO`` candidates are
     omitted; only ``HASH_HIGH`` and ``HASH_LOW`` spans are returned.
+
+    Args:
+        text: Input string to scan.
+        entropy_threshold: Shannon entropy cutoff (default 3.0).
+        whitelist: Token whitelist to use; defaults to :data:`HEX_WORDS_WHITELIST`.
+        min_len: Minimum hex token length to classify (default 8).
     """
     if not text:
         return []
+    token_re = _TOKEN_RE if min_len == _MIN_WHITELIST_LEN else _build_token_re(min_len)
     spans: list[HashSpan] = []
-    for match in _TOKEN_RE.finditer(text):
+    for match in token_re.finditer(text):
         token = match.group(0)
-        priority = detect_hash_priority(token, entropy_threshold=entropy_threshold)
+        priority = detect_hash_priority(
+            token,
+            entropy_threshold=entropy_threshold,
+            whitelist=whitelist,
+            min_len=min_len,
+        )
         if priority == HASH_NO:
             continue
         spans.append(HashSpan(match.start(), match.end(), token, priority))

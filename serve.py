@@ -55,7 +55,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 import hash_detect
-from hash_detect import HASH_HIGH, HASH_LOW, find_hash_spans
+from hash_detect import (
+    HASH_HIGH,
+    HASH_LOW,
+    _MIN_WHITELIST_LEN,
+    build_whitelist,
+    find_hash_spans,
+)
 
 # Sentinel brackets are rare unicode so they are extremely unlikely to occur in
 # real input and survive JSON round-trips. Format: ⟦<KIND>:<n>⟧
@@ -150,11 +156,17 @@ class _Redactor:
         checkpoint: str | None,
         output_mode: str,
         detect_hashes: bool = True,
+        entropy_threshold: float = 3.0,
+        hash_min_len: int = _MIN_WHITELIST_LEN,
+        whitelist: frozenset[str] | None = None,
     ) -> None:
         from opf._api import OPF
 
         self._output_mode = output_mode
         self._detect_hashes = detect_hashes
+        self._entropy_threshold = entropy_threshold
+        self._hash_min_len = hash_min_len
+        self._whitelist = whitelist  # None means use hash_detect module default
         # OPF inference is not guaranteed thread-safe; serialize calls.
         self._lock = threading.Lock()
 
@@ -226,7 +238,12 @@ class _Redactor:
                 if self._detect_hashes:
                     hash_match = [
                         _MergedSpan(hs.start, hs.end, hs.priority, "hash")
-                        for hs in find_hash_spans(text)
+                        for hs in find_hash_spans(
+                            text,
+                            entropy_threshold=self._entropy_threshold,
+                            whitelist=self._whitelist,
+                            min_len=self._hash_min_len,
+                        )
                     ]
 
                 # 2) OPF detection.
@@ -402,12 +419,53 @@ def main(argv: list[str] | None = None) -> None:
             "false-positive hex strings (e.g. SHA-256s of public artifacts)."
         ),
     )
+    parser.add_argument(
+        "--entropy-threshold",
+        type=float,
+        default=3.0,
+        help="Shannon entropy cutoff for hash detection (default 3.0).",
+    )
+    parser.add_argument(
+        "--hash-min-len",
+        type=int,
+        default=_MIN_WHITELIST_LEN,
+        help=f"Minimum hex token length to classify as a hash (default {_MIN_WHITELIST_LEN}).",
+    )
+    parser.add_argument(
+        "--whitelist-add",
+        nargs="*",
+        default=[],
+        metavar="TOKEN",
+        help="Hex tokens to add to the built-in whitelist (space-separated).",
+    )
+    parser.add_argument(
+        "--whitelist-remove",
+        nargs="*",
+        default=[],
+        metavar="TOKEN",
+        help="Hex tokens to remove from the built-in whitelist (space-separated).",
+    )
+    parser.add_argument(
+        "--whitelist-file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path to a whitelist-override file. Same format as OPF_HASH_WHITELIST_FILE: "
+            "one token per line, '-token' to remove a built-in, '#' for comments."
+        ),
+    )
     parser.set_defaults(detect_hashes=True)
     args = parser.parse_args(argv)
 
+    whitelist = build_whitelist(
+        add=args.whitelist_add,
+        remove=args.whitelist_remove,
+        whitelist_file=args.whitelist_file,
+    ) if (args.whitelist_add or args.whitelist_remove or args.whitelist_file) else None
     print(
         f"Loading OPF model (device={args.device}, output_mode={args.output_mode}, "
-        f"hash_detect={args.detect_hashes})...",
+        f"hash_detect={args.detect_hashes}, entropy_threshold={args.entropy_threshold}, "
+        f"hash_min_len={args.hash_min_len})...",
         flush=True,
     )
     redactor: _Redactor = _Redactor(
@@ -415,6 +473,9 @@ def main(argv: list[str] | None = None) -> None:
         checkpoint=args.checkpoint,
         output_mode=args.output_mode,
         detect_hashes=args.detect_hashes,
+        entropy_threshold=args.entropy_threshold,
+        hash_min_len=args.hash_min_len,
+        whitelist=whitelist,
     )
     timeout_s = args.timeout if args.timeout and args.timeout > 0 else None
     handler = _build_handler(redactor, timeout_s)

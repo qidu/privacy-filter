@@ -118,19 +118,41 @@ In addition to the OPF model, the sidecar runs a fast entropy-based scan
 signed-URL hashes) that sequence-labelling models tend to miss. Hash spans get
 the sentinel prefix `HASH:`; PII spans get `PII:`. On overlap, hash spans always
 win (priority order `HASH_HIGH > HASH_LOW > MODEL`), so the most reliable signal
-wins. Disable with `--no-hash-detect` if your input contains too many
-false-positive hex strings (e.g. SHA-256s of public artifacts you want to keep).
+wins.
 
-To extend or trim the built-in whitelist without editing `hash_detect.py`, set
-`OPF_HASH_WHITELIST_FILE=/path/to/whitelist.txt` before launching the sidecar.
-One entry per line: a bare token is added, a `-token` line removes a built-in,
-`#` starts a comment. Entries shorter than 8 chars are ignored.
+The hash detector is tunable via CLI flags:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--no-hash-detect` | (hash detection on) | Disable the hash detector entirely. Use when input contains many false-positive hex strings (e.g. SHA-256s of public artifacts). |
+| `--entropy-threshold FLOAT` | `3.0` | Shannon entropy cutoff. Tokens below this value are not classified as hashes. Lower values catch more strings; higher values reduce false positives. |
+| `--hash-min-len INT` | `8` | Minimum hex token length to consider. Tokens shorter than this are never classified as hashes. |
+| `--whitelist-add TOKEN ...` | — | One or more hex tokens to add to the built-in skip-list (space-separated). |
+| `--whitelist-remove TOKEN ...` | — | One or more built-in whitelist tokens to remove, so they are treated as detectable hashes. |
+| `--whitelist-file PATH` | — | Path to a whitelist-override file (same format as `OPF_HASH_WHITELIST_FILE`, see below). Applied after `--whitelist-add`/`--whitelist-remove`. |
+
+Example — stricter detection, with a custom placeholder excluded:
+
+```bash
+python serve.py --device cpu --port 8799 \
+  --entropy-threshold 3.5 \
+  --hash-min-len 10 \
+  --whitelist-add badcafe12 \
+  --whitelist-remove fabaceae
+```
+
+**Whitelist file format** (usable via `--whitelist-file` or the
+`OPF_HASH_WHITELIST_FILE` env-var):
 
 ```
 # ~/.opf/hash_whitelist.txt
 badcafe12           # add: don't flag this placeholder
 -fabaceae           # remove: treat this as a real hash
 ```
+
+One entry per line. A bare token is added to the whitelist; a `-token` line
+removes a built-in entry; `#` starts a comment. Entries shorter than 8 chars
+are ignored.
 
 #### End-to-end example
 
